@@ -155,8 +155,20 @@ def _parse_osu(osu_text: str) -> Tuple[int, List[HitObj]]:
     return keys, objs
 
 def _window_peak_nps(times_ms: List[int], window_ms: int = 5000) -> float:
+    """
+    Peak NPS in a sliding window.
+
+    IMPORTANT: if the map (or requested section) is shorter than `window_ms`,
+    callers should pass window_ms=min(5000, duration_ms) to avoid peak < average.
+    """
     if not times_ms:
         return 0.0
+    try:
+        window_ms = int(window_ms)
+    except Exception:
+        window_ms = 5000
+    window_ms = max(1, window_ms)
+
     times_ms.sort()
     q = deque()
     best = 0
@@ -165,7 +177,8 @@ def _window_peak_nps(times_ms: List[int], window_ms: int = 5000) -> float:
         while q and (t - q[0]) > window_ms:
             q.popleft()
         best = max(best, len(q))
-    return best / (window_ms / 1000)
+    return best / (window_ms / 1000.0)
+
 
 def _lane_bias(counts: List[int]) -> float:
     total = sum(counts)
@@ -238,11 +251,23 @@ def _transition_spikes(times_ms: List[int], bucket_ms: int = 2000, spike_ratio: 
             spikes += 1
     return int(spikes)
 
-def compute_metrics(osu_text: str) -> Dict[str, Any]:
+def compute_metrics(osu_text: str, *, allow_empty: bool = True) -> Dict[str, Any]:
+    """
+    Compute lightweight BN metrics from parsed HitObjects.
+
+    - If parsing yields 0 objects:
+      - allow_empty=True: return zeros + warnings (for /calc_sr to still succeed)
+      - allow_empty=False: raise ValueError (so /analyze_patterns can return 400)
+    """
     keys, objs = _parse_osu(osu_text)
     if not objs:
+        if not allow_empty:
+            raise ValueError("No hitobjects parsed from osu_text.")
         return {
             "keys": keys,
+            "object_count": 0,
+            "duration_ms": 0,
+            "peak_window_ms": 0,
             "nps_avg": 0.0,
             "nps_peak_5s": 0.0,
             "lane_bias": 0.0,
@@ -251,13 +276,16 @@ def compute_metrics(osu_text: str) -> Dict[str, Any]:
             "chord_dist": {},
             "ln_ratio": 0.0,
             "transition_spikes": 0,
+            "warnings": ["no_hitobjects_parsed"],
         }
 
     times = sorted([o.t for o in objs])
-    length_s = max(1e-6, (times[-1] - times[0]) / 1000.0)
+    duration_ms = max(1, int(times[-1] - times[0]))
+    length_s = duration_ms / 1000.0
+    peak_window_ms = min(5000, duration_ms)
 
     nps_avg = len(objs) / length_s
-    nps_peak = _window_peak_nps(times, 5000)
+    nps_peak = _window_peak_nps(times, peak_window_ms)
 
     lane_counts = [0] * keys
     for o in objs:
@@ -271,6 +299,9 @@ def compute_metrics(osu_text: str) -> Dict[str, Any]:
 
     return {
         "keys": keys,
+        "object_count": int(len(objs)),
+        "duration_ms": int(duration_ms),
+        "peak_window_ms": int(peak_window_ms),
         "nps_avg": round(nps_avg, 4),
         "nps_peak_5s": round(nps_peak, 4),
         "lane_bias": round(bias, 4),
@@ -279,7 +310,9 @@ def compute_metrics(osu_text: str) -> Dict[str, Any]:
         "chord_dist": chord_dist,
         "ln_ratio": round(ln_ratio, 4),
         "transition_spikes": int(spikes),
+        "warnings": [],
     }
+
 
 # ---------------------------
 # rosu-pp helpers (SR / PP)
@@ -302,7 +335,7 @@ def calc_sr_with_rosu(osu_text: str, mods: Any = "") -> Dict[str, Any]:
     except Exception:
         pass
 
-    diff = rosu.Difficulty(mods=_parse_mods(mods), lazer=False)
+    diff = rosu.Difficulty(mods=_parse_mods(mods))
     attrs = diff.calculate(m)
     return {"keys": keys, "sr": float(attrs.stars)}
 
@@ -319,10 +352,8 @@ def calc_pp_with_rosu(osu_text: str, acc: float = 95.0, mods: Any = "") -> Dict[
     perf = rosu.Performance(
         accuracy=float(acc),
         mods=_parse_mods(mods),
-        lazer=False,
         hitresult_priority=rosu.HitResultPriority.Fastest,
     )
-
     attrs = perf.calculate(m)
     return {"keys": keys, "pp": float(attrs.pp), "sr": float(attrs.difficulty.stars)}
 
@@ -388,74 +419,124 @@ def analyze_patterns():
     if not osu_text:
         return jsonify({"error": "Missing osu_text or openaiFileIdRefs"}), 400
 
+    # Basic structural validation to avoid "metrics=0" ambiguous successes
+    if "[HitObjects]" not in osu_text:
+        return jsonify({"error": "invalid osu_text: missing [HitObjects] section"}), 400
+
     section = data.get("section")
+
+    # Always compute baseline (whole map) first; if this fails, return a clean 400.
+    try:
+        base_metrics = compute_metrics(osu_text, allow_empty=False)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": f"failed to parse hitobjects: {str(e)}"}), 400
+
+    # If a section is provided, attempt section metrics; if empty, fall back to baseline with a warning.
+    scope = "all"
+    metrics = dict(base_metrics)
+    requested_section = None
+    section_object_count = None
+
+    def _to_ms(s: str) -> int:
+        # supports mm:ss and mm:ss.xxx
+        mm, ss = s.strip().split(":")
+        return int(round((int(mm) * 60 + float(ss)) * 1000))
+
+    def _metrics_from_objs(keys: int, objs: List[HitObj]) -> Dict[str, Any]:
+        times = sorted([o.t for o in objs])
+        duration_ms = max(1, int(times[-1] - times[0]))
+        length_s = duration_ms / 1000.0
+        peak_window_ms = min(5000, duration_ms)
+
+        nps_avg = len(objs) / length_s
+        nps_peak = _window_peak_nps(times, peak_window_ms)
+
+        lane_counts = [0] * keys
+        for o in objs:
+            lane_counts[o.lane] += 1
+
+        bias = _lane_bias(lane_counts)
+        jack_count, jack_sections = _detect_jacks(objs, jack_ms=100)
+        chord_dist = _chord_distribution(objs)
+        ln_ratio = sum(1 for o in objs if o.is_ln) / max(1, len(objs))
+        spikes = _transition_spikes(times)
+
+        return {
+            "keys": keys,
+            "object_count": int(len(objs)),
+            "duration_ms": int(duration_ms),
+            "peak_window_ms": int(peak_window_ms),
+            "nps_avg": round(nps_avg, 4),
+            "nps_peak_5s": round(nps_peak, 4),
+            "lane_bias": round(bias, 4),
+            "jack_count": int(jack_count),
+            "jack_sections": jack_sections[:200],
+            "chord_dist": chord_dist,
+            "ln_ratio": round(ln_ratio, 4),
+            "transition_spikes": int(spikes),
+            "warnings": [],
+        }
+
     if isinstance(section, str) and "-" in section:
-        def to_ms(s: str) -> int:
-            mm, ss = s.strip().split(":")
-            return (int(mm) * 60 + int(ss)) * 1000
+        requested_section = section
         try:
             a, b = section.split("-", 1)
-            start_ms = to_ms(a)
-            end_ms = to_ms(b)
+            start_ms = _to_ms(a)
+            end_ms = _to_ms(b)
+            if end_ms < start_ms:
+                start_ms, end_ms = end_ms, start_ms
+
             keys, objs = _parse_osu(osu_text)
             objs = [o for o in objs if start_ms <= o.t <= end_ms]
-            if objs:
-                times = sorted([o.t for o in objs])
-                length_s = max(1e-6, (times[-1] - times[0]) / 1000.0)
-                nps_avg = len(objs) / length_s
-                nps_peak = _window_peak_nps(times, 5000)
-                lane_counts = [0] * keys
-                for o in objs:
-                    lane_counts[o.lane] += 1
-                bias = _lane_bias(lane_counts)
-                jack_count, jack_sections = _detect_jacks(objs, 100)
-                chord_dist = _chord_distribution(objs)
-                ln_ratio = sum(1 for o in objs if o.is_ln) / max(1, len(objs))
-                spikes = _transition_spikes(times)
+            section_object_count = int(len(objs))
 
-                metrics = {
-                    "keys": keys,
-                    "nps_avg": round(nps_avg, 4),
-                    "nps_peak_5s": round(nps_peak, 4),
-                    "lane_bias": round(bias, 4),
-                    "jack_count": int(jack_count),
-                    "jack_sections": jack_sections[:200],
-                    "chord_dist": chord_dist,
-                    "ln_ratio": round(ln_ratio, 4),
-                    "transition_spikes": int(spikes),
-                }
+            if objs:
+                scope = "section"
+                metrics = _metrics_from_objs(keys, objs)
             else:
-                metrics = compute_metrics(osu_text)
+                # fall back to baseline, but make it explicit
+                metrics = dict(base_metrics)
+                metrics.setdefault("warnings", [])
+                metrics["warnings"].append("empty_section_range_fallback_to_all")
         except Exception:
-            metrics = compute_metrics(osu_text)
-    else:
-        metrics = compute_metrics(osu_text)
+            metrics = dict(base_metrics)
+            metrics.setdefault("warnings", [])
+            metrics["warnings"].append("invalid_section_fallback_to_all")
 
     # Risk hints (NOT hard rules)
     risks = []
-    b = metrics.get("lane_bias", 0.0)
+    b = float(metrics.get("lane_bias", 0.0) or 0.0)
     if b >= 0.18:
-        risks.append({"type": "lane_bias", "level": "HIGH", "reason": f"lane_bias={b} (unbalanced distribution)", "section": section or "all"})
+        risks.append({"type": "lane_bias", "level": "HIGH", "reason": f"lane_bias={b} (unbalanced distribution)", "section": requested_section or "all"})
     elif b >= 0.12:
-        risks.append({"type": "lane_bias", "level": "MID", "reason": f"lane_bias={b}", "section": section or "all"})
+        risks.append({"type": "lane_bias", "level": "MID", "reason": f"lane_bias={b}", "section": requested_section or "all"})
 
-    jc = metrics.get("jack_count", 0)
+    jc = int(metrics.get("jack_count", 0) or 0)
     if jc >= 8:
-        risks.append({"type": "jack_density", "level": "HIGH", "reason": f"jack_sequences={jc}", "section": section or "all"})
+        risks.append({"type": "jack_density", "level": "HIGH", "reason": f"jack_sequences={jc}", "section": requested_section or "all"})
     elif jc >= 3:
-        risks.append({"type": "jack_density", "level": "MID", "reason": f"jack_sequences={jc}", "section": section or "all"})
+        risks.append({"type": "jack_density", "level": "MID", "reason": f"jack_sequences={jc}", "section": requested_section or "all"})
 
     chord_dist = metrics.get("chord_dist", {}) or {}
     max_chord = 0
     for k in chord_dist.keys():
         try:
-            max_chord = max(max_chord, int(k.replace("k", "")))
+            max_chord = max(max_chord, int(str(k).replace("k", "")))
         except Exception:
             pass
     if max_chord >= 6:
-        risks.append({"type": "large_chords", "level": "MID", "reason": f"max_chord={max_chord}", "section": section or "all"})
+        risks.append({"type": "large_chords", "level": "MID", "reason": f"max_chord={max_chord}", "section": requested_section or "all"})
 
-    return jsonify({"metrics": metrics, "risks": risks})
+    return jsonify({
+        "scope": scope,
+        "requested_section": requested_section,
+        "section_object_count": section_object_count,
+        "metrics": metrics,
+        "risks": risks
+    })
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
