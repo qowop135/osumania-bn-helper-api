@@ -1,0 +1,237 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Osumania BN Helper API",
+    "description": "SR/PP + BN metrics for osu!mania. Accepts either osu_text or OpenAI file refs (recommended).",
+    "version": "1.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-SERVER-URL"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "OpenAIFileRef": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "download_link": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "download_link"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Health check",
+        "description": "Returns ok=true when the service is up.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/calc_sr": {
+      "post": {
+        "operationId": "calcSr",
+        "summary": "Calculate SR",
+        "description": "Compute osu!mania SR and return BN metrics. Prefer openaiFileIdRefs to avoid payload limits.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "osu_text": {
+                    "type": "string",
+                    "description": "Optional. Full .osu text."
+                  },
+                  "openaiFileIdRefs": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/OpenAIFileRef"
+                    },
+                    "description": "Optional. Up to 10 files from the conversation as OpenAI file refs."
+                  },
+                  "mods": {
+                    "type": "string",
+                    "default": ""
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SR + metrics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/calc_pp": {
+      "post": {
+        "operationId": "calcPp",
+        "summary": "Calculate PP",
+        "description": "Compute PP for given acc/mods. Prefer openaiFileIdRefs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "osu_text": {
+                    "type": "string"
+                  },
+                  "openaiFileIdRefs": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/OpenAIFileRef"
+                    },
+                    "description": "Optional. File refs."
+                  },
+                  "acc": {
+                    "type": "number",
+                    "default": 95.0
+                  },
+                  "mods": {
+                    "type": "string",
+                    "default": ""
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PP + SR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    },
+    "/analyze_patterns": {
+      "post": {
+        "operationId": "analyzePatterns",
+        "summary": "Analyze patterns",
+        "description": "Extract NPS/bias/jacks/chords/LN ratio + risk hints (not hard rules). Prefer openaiFileIdRefs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "osu_text": {
+                    "type": "string"
+                  },
+                  "openaiFileIdRefs": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/OpenAIFileRef"
+                    },
+                    "description": "Optional. File refs."
+                  },
+                  "section": {
+                    "type": "string",
+                    "description": "Optional slice 'mm:ss-mm:ss'."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Metrics + risks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        }
+      }
+    }
+  }
+}
