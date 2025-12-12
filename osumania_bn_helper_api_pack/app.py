@@ -70,7 +70,7 @@ def _osu_text_from_openai_file_refs(openai_file_refs: Any) -> Optional[str]:
     if not picked:
         return None
 
-    url = picked.get("download_link")
+    url = picked.get("download_link") or picked.get("download_url") or picked.get("url") or picked.get("downloadUrl") or picked.get("downloadURL")
     if not url:
         return None
 
@@ -82,16 +82,32 @@ def _osu_text_from_openai_file_refs(openai_file_refs: Any) -> Optional[str]:
     return r.content.decode("utf-8", errors="replace")
 
 def get_osu_text_from_request(data: dict) -> Optional[str]:
+    """
+    Prefer file refs (openaiFileIdRefs) to avoid truncated osu_text.
+    If both are present, use file refs first. Fallback to osu_text.
+    """
+    refs = data.get("openaiFileIdRefs")
+    if refs:
+        try:
+            fetched = _osu_text_from_openai_file_refs(refs)
+            if isinstance(fetched, str) and fetched.strip():
+                return fetched
+        except Exception:
+            pass
+
     osu_text = data.get("osu_text")
     if isinstance(osu_text, str) and osu_text.strip():
+        # If truncated and missing HitObjects but refs were provided, try refs again
+        if "[HitObjects]" not in osu_text and refs:
+            try:
+                fetched = _osu_text_from_openai_file_refs(refs)
+                if isinstance(fetched, str) and fetched.strip():
+                    return fetched
+            except Exception:
+                pass
         return osu_text
 
-    # OpenAI file refs parameter name must be `openaiFileIdRefs`
-    refs = data.get("openaiFileIdRefs")
-    try:
-        return _osu_text_from_openai_file_refs(refs)
-    except Exception:
-        return None
+    return None
 
 # ---------------------------
 # Minimal .osu parsing for BN metrics
@@ -378,8 +394,10 @@ def calc_sr():
         return jsonify({"error": "Missing osu_text or openaiFileIdRefs"}), 400
 
     try:
+        if "[HitObjects]" not in osu_text:
+            return jsonify({"error": "invalid osu_text: missing [HitObjects] section"}), 400
         sr = calc_sr_with_rosu(osu_text, mods=mods)
-        metrics = compute_metrics(osu_text)
+        metrics = compute_metrics(osu_text, allow_empty=False)
         return jsonify({"keys": sr["keys"], "sr": sr["sr"], "details": metrics})
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
@@ -401,6 +419,8 @@ def calc_pp():
         return jsonify({"error": "Missing osu_text or openaiFileIdRefs"}), 400
 
     try:
+        if "[HitObjects]" not in osu_text:
+            return jsonify({"error": "invalid osu_text: missing [HitObjects] section"}), 400
         out = calc_pp_with_rosu(osu_text, acc=float(acc), mods=mods)
         return jsonify(out)
     except ValueError as ve:
