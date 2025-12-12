@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://YOUR-SERVER-URL"
+      "url": "https://osumania-bn-helper-api.onrender.com"
     }
   ],
   "components": {
