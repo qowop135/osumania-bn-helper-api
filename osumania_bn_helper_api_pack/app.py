@@ -302,7 +302,7 @@ def calc_sr_with_rosu(osu_text: str, mods: Any = "") -> Dict[str, Any]:
     except Exception:
         pass
 
-    diff = rosu.Difficulty(mods=_parse_mods(mods))
+    diff = rosu.Difficulty(mods=_parse_mods(mods), lazer=False)
     attrs = diff.calculate(m)
     return {"keys": keys, "sr": float(attrs.stars)}
 
@@ -319,8 +319,10 @@ def calc_pp_with_rosu(osu_text: str, acc: float = 95.0, mods: Any = "") -> Dict[
     perf = rosu.Performance(
         accuracy=float(acc),
         mods=_parse_mods(mods),
+        lazer=False,
         hitresult_priority=rosu.HitResultPriority.Fastest,
     )
+
     attrs = perf.calculate(m)
     return {"keys": keys, "pp": float(attrs.pp), "sr": float(attrs.difficulty.stars)}
 
